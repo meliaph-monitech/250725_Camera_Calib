@@ -1,3 +1,5 @@
+import sys
+print("Python version:", sys.version)
 import streamlit as st
 import zipfile
 import os
