@@ -1,0 +1,4 @@
+streamlit>=1.25.0
+opencv-contrib-python>=4.8.0
+matplotlib>=3.8.0
+numpy>=1.23.0
