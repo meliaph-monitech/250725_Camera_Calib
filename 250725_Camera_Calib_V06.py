@@ -2,41 +2,27 @@ import sys
 print("Python version:", sys.version)
 import streamlit as st
 import zipfile
+import tempfile
 import os
-import io
+import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import json
-import plotly.express as px
-from PIL import Image
-from pathlib import Path
+import shutil
+import glob
+from io import BytesIO
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
-# Defer cv2 import to avoid Streamlit Cloud issues
-# try:
-#     import cv2
-# except Exception as e:
-#     st.error(f"OpenCV import failed: {e}")
-#     st.stop()
-try:
-    import cv2
-    from cv2 import aruco
-    assert hasattr(cv2.aruco, "CharucoBoard_create"), "CharucoBoard_create not available"
-except Exception as e:
-    st.error(f"OpenCV ArUco module is not available: {e}")
-    st.stop()
+st.set_page_config(layout="wide")
+st.title("📷 Camera Calibration with CharuCo")
 
+# --- Sidebar: File Upload ---
+zip_file = st.sidebar.file_uploader("Upload ZIP of Calibration Images", type="zip")
 
-# Title
-st.title("Camera Calibration with CharuCo Board")
-
-# Sidebar Inputs
-st.sidebar.header("Calibration Settings")
-
-# Camera Info (text fields)
+# --- Sidebar: Camera Info ---
 camera_model = st.sidebar.text_input("Camera Model")
 camera_serial = st.sidebar.text_input("Camera Serial Number")
 lens_model = st.sidebar.text_input("Lens Model")
-
 distortion_model = st.sidebar.selectbox("Distortion Model", ["regular (5 parameters)", "rational (8 parameters)"])
 
 aruco_dict_options = [d for d in dir(cv2.aruco) if d.startswith('DICT_')]
@@ -50,134 +36,161 @@ marker_length = st.sidebar.number_input("Marker Length [mm]", min_value=1.0, val
 grid_size = st.sidebar.number_input("Grid Analysis Size", min_value=5, value=15)
 ok_threshold = st.sidebar.number_input("OK Threshold (corners)", min_value=5, value=50)
 
-# ZIP Upload
-zip_file = st.sidebar.file_uploader("Upload ZIP of Calibration Images", type="zip")
 show_analysis = st.sidebar.button("Show Analysis")
 
+# Temporary folder to extract images
+@st.cache_data(show_spinner=False)
+def extract_zip(file):
+    tmpdir = tempfile.mkdtemp()
+    with zipfile.ZipFile(file, "r") as z:
+        z.extractall(tmpdir)
+    return tmpdir
+
 if zip_file:
-    # Unzip to temp directory
-    temp_dir = Path("temp_images")
-    if temp_dir.exists():
-        for file in temp_dir.glob("*"):
-            file.unlink()
-    else:
-        temp_dir.mkdir()
+    image_dir = extract_zip(zip_file)
+    image_paths = sorted(glob.glob(os.path.join(image_dir, "*.jpg")) + glob.glob(os.path.join(image_dir, "*.png")))
+    selected_image = st.sidebar.selectbox("Choose Image for Display", [os.path.basename(p) for p in image_paths])
 
-    with zipfile.ZipFile(zip_file, "r") as zip_ref:
-        zip_ref.extractall(temp_dir)
+    # --- Image Carousel ---
+    st.subheader("🖼️ Image Preview")
+    idx = [os.path.basename(p) for p in image_paths].index(selected_image)
+    st.image(image_paths[idx], caption=selected_image, use_column_width=True)
 
-    image_paths = sorted(list(temp_dir.glob("*.jpg")) + list(temp_dir.glob("*.png")) + list(temp_dir.glob("*.jpeg")))
+    # --- Calibration Logic ---
+    if show_analysis:
+        st.subheader("📐 Calibration Results")
 
-    if len(image_paths) == 0:
-        st.warning("No valid image files found in ZIP.")
-        st.stop()
+        aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_option))
+        board = cv2.aruco.CharucoBoard_create(squares_x, squares_y, square_length, marker_length, aruco_dict)
 
-    st.subheader("Image Preview")
-    st.image(str(image_paths[0]), caption="Sample Image", use_column_width=True)
+        all_corners, all_ids, imsize = [], [], None
+        valid_images = []
 
-    # Calibration logic
-    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_option))
-    board = cv2.aruco.CharucoBoard_create(squares_x, squares_y, square_length, marker_length, aruco_dict)
-
-    all_corners = []
-    all_ids = []
-    img_size = None
-
-    for img_path in image_paths:
-        img = cv2.imread(str(img_path))
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict)
-
-        if len(corners) > 0:
-            _, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
-            if ch_corners is not None and ch_ids is not None and len(ch_corners) > 4:
-                all_corners.append(ch_corners)
-                all_ids.append(ch_ids)
-                img_size = gray.shape[::-1]
-
-    if len(all_corners) >= 5:
-        flags = 0 if distortion_model.startswith("regular") else cv2.CALIB_RATIONAL_MODEL
-        ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
-            all_corners, all_ids, board, img_size, None, None, flags=flags)
-
-        st.subheader("Calibration Results")
-        st.markdown(f"**Camera Model**: {camera_model}")
-        st.markdown(f"**Serial Number**: {camera_serial}")
-        st.markdown(f"**Lens Model**: {lens_model}")
-
-        st.markdown("**Camera Matrix:**")
-        st.code(np.array2string(camera_matrix, precision=4, suppress_small=True))
-
-        st.markdown("**Distortion Coefficients:**")
-        st.code(np.array2string(dist_coeffs, precision=4, suppress_small=True))
-
-        st.markdown("**Image Size:**")
-        st.code(f"{img_size}")
-
-        if show_analysis:
-            grid_x = np.linspace(0, img_size[0], grid_size)
-            grid_y = np.linspace(0, img_size[1], grid_size)
-            gx, gy = np.meshgrid(grid_x, grid_y)
-            grid = np.stack([gx.ravel(), gy.ravel()], axis=-1)
-
-            undistorted = cv2.undistortPoints(grid.astype(np.float32).reshape(-1, 1, 2), camera_matrix, dist_coeffs, P=camera_matrix)
-            undistorted = undistorted.reshape(-1, 2)
-
-            fig_grid = plt.figure()
-            plt.scatter(grid[:, 0], grid[:, 1], label='Original', s=10)
-            plt.scatter(undistorted[:, 0], undistorted[:, 1], label='Undistorted', s=10)
-            plt.legend()
-            plt.title("Grid Corner Analysis (Before & After Undistortion)")
-            st.pyplot(fig_grid)
-
-            # Avg projection error image-wise
-            st.subheader("Average Reprojection Error")
-            selected_img = st.selectbox("Select Image for Error Visualization", [str(p.name) for p in image_paths])
-            img = cv2.imread(str(temp_dir / selected_img))
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        for img_path in image_paths:
+            image = cv2.imread(img_path)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict)
+            if ids is not None:
+                _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
+                if charuco_corners is not None and charuco_ids is not None and len(charuco_corners) > ok_threshold:
+                    all_corners.append(charuco_corners)
+                    all_ids.append(charuco_ids)
+                    valid_images.append(img_path)
+                    if imsize is None:
+                        imsize = gray.shape[::-1]
 
-            if len(corners) > 0:
-                _, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
-                if ch_corners is not None and ch_ids is not None:
-                    retval, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-                        ch_corners, ch_ids, board, camera_matrix, dist_coeffs, None, None)
-                    if retval:
-                        proj_pts, _ = cv2.projectPoints(board.chessboardCorners[ch_ids.flatten()], rvec, tvec, camera_matrix, dist_coeffs)
-                        errors = np.linalg.norm(proj_pts.squeeze() - ch_corners.squeeze(), axis=1)
+        if len(all_corners) < 3:
+            st.error("Not enough valid images for calibration. Try lowering OK threshold.")
+        else:
+            flags = 0
+            if distortion_model == "rational (8 parameters)":
+                flags |= cv2.CALIB_RATIONAL_MODEL
 
-                        fig_err = px.scatter(x=ch_corners.squeeze()[:, 0], y=ch_corners.squeeze()[:, 1],
-                                             color=errors, color_continuous_scale='Viridis',
-                                             labels={'x': 'X', 'y': 'Y', 'color': 'Reprojection Error'},
-                                             title='Reprojection Error per Corner')
-                        st.plotly_chart(fig_err)
+            ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
+                charucoCorners=all_corners,
+                charucoIds=all_ids,
+                board=board,
+                imageSize=imsize,
+                cameraMatrix=None,
+                distCoeffs=None,
+                flags=flags
+            )
 
-                        fig3d = px.scatter_3d(x=ch_corners.squeeze()[:, 0],
-                                              y=ch_corners.squeeze()[:, 1],
-                                              z=errors,
-                                              color=errors,
-                                              labels={'x': 'X', 'y': 'Y', 'z': 'L2 Error'},
-                                              title="3D Error Plot",
-                                              hover_name=[f"Error: {e:.2f}" for e in errors])
-                        st.plotly_chart(fig3d)
+            # --- Results Display ---
+            st.write("### 📸 Camera Matrix")
+            st.code(np.array2string(camera_matrix, precision=4, separator=", "))
 
-        # Export calibration file
-        if st.button("Export Calibration"):
-            output = {
-                "camera_model": camera_model,
-                "serial_number": camera_serial,
-                "lens_model": lens_model,
-                "image_size": img_size,
-                "camera_matrix": camera_matrix.tolist(),
-                "distortion_coefficients": dist_coeffs.tolist(),
-                "distortion_model": distortion_model
-            }
-            json_data = json.dumps(output, indent=2)
-            st.download_button(label="Download Calibration JSON",
-                               data=json_data,
-                               file_name=f"calibration_{camera_model}_{camera_serial}.json",
-                               mime="application/json")
+            st.write("### 🎯 Distortion Coefficients")
+            st.code(np.array2string(dist_coeffs, precision=4, separator=", "))
 
+            st.write("### 🖼️ Image Size")
+            st.code(f"{imsize}")
 
-    else:
-        st.warning("Not enough valid CharuCo detections for calibration (need at least 5 images with 4+ corners)")
+            # --- Grid Analysis (2D Plot) ---
+            fig, ax = plt.subplots()
+            ax.set_title("CharuCo Grid Points per Image")
+            ax.bar(range(len(valid_images)), [len(ids) for ids in all_ids])
+            ax.axhline(ok_threshold, color="red", linestyle="--", label="OK Threshold")
+            ax.set_xlabel("Image Index")
+            ax.set_ylabel("Corners Detected")
+            ax.legend()
+            st.pyplot(fig)
+
+            # --- Reprojection Error (per image) ---
+            reproj_errors = []
+            for i in range(len(valid_images)):
+                imgpoints2, _ = cv2.projectPoints(all_corners[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
+                error = cv2.norm(all_corners[i], imgpoints2, cv2.NORM_L2) / len(imgpoints2)
+                reproj_errors.append(error)
+
+            st.write("### 📊 Reprojection Error per Image")
+            error_fig, error_ax = plt.subplots()
+            error_ax.plot(reproj_errors, marker="o")
+            error_ax.set_xlabel("Image Index")
+            error_ax.set_ylabel("Reprojection Error (L2 norm)")
+            st.pyplot(error_fig)
+
+            # --- 3D Visualization of Reprojection Error ---
+            fig3d = plt.figure()
+            ax3d = fig3d.add_subplot(111, projection='3d')
+            for i, (rvec, tvec, corners) in enumerate(zip(rvecs, tvecs, all_corners)):
+                projected, _ = cv2.projectPoints(corners, rvec, tvec, camera_matrix, dist_coeffs)
+                for pt, proj in zip(corners, projected):
+                    x, y = pt[0]
+                    xp, yp = proj[0]
+                    err = np.linalg.norm([x - xp, y - yp])
+                    ax3d.scatter(x, y, err, c='b', marker='o')
+            ax3d.set_xlabel("X")
+            ax3d.set_ylabel("Y")
+            ax3d.set_zlabel("Reproj Error (L2)")
+            st.pyplot(fig3d)
+
+            # --- Extrinsics Visualization (Axes Overlay) ---
+            st.subheader("🧭 Extrinsics Visualization (Axes Overlay)")
+            
+            selected_extrinsic_img = st.selectbox("Choose Image for Extrinsic Axes", [os.path.basename(p) for p in valid_images])
+            extrinsic_idx = [os.path.basename(p) for p in valid_images].index(selected_extrinsic_img)
+            
+            # Reload image
+            image = cv2.imread(valid_images[extrinsic_idx])
+            image_axes = image.copy()
+            
+            # Define 3D axes (X: red, Y: green, Z: blue)
+            axis_length = square_length * 0.5  # half square size
+            axis_3d = np.float32([[axis_length,0,0], [0,axis_length,0], [0,0,-axis_length]]).reshape(-1,3)
+            
+            # Find the center of the CharuCo board for origin placement
+            corner = all_corners[extrinsic_idx][0]
+            origin_2d, _ = cv2.projectPoints(np.zeros((1,3)), rvecs[extrinsic_idx], tvecs[extrinsic_idx], camera_matrix, dist_coeffs)
+            axes_2d, _ = cv2.projectPoints(axis_3d, rvecs[extrinsic_idx], tvecs[extrinsic_idx], camera_matrix, dist_coeffs)
+            
+            corner = tuple(origin_2d[0].ravel().astype(int))
+            x_axis = tuple(axes_2d[0].ravel().astype(int))
+            y_axis = tuple(axes_2d[1].ravel().astype(int))
+            z_axis = tuple(axes_2d[2].ravel().astype(int))
+            
+            cv2.line(image_axes, corner, x_axis, (0,0,255), 3)  # X - Red
+            cv2.line(image_axes, corner, y_axis, (0,255,0), 3)  # Y - Green
+            cv2.line(image_axes, corner, z_axis, (255,0,0), 3)  # Z - Blue
+            cv2.circle(image_axes, corner, 5, (255,255,255), -1)
+            
+            st.image(image_axes, caption="Extrinsics Axes Visualization", use_column_width=True)
+
+            
+            # --- Export Calibration ---
+            if st.button("📁 Export Calibration JSON"):
+                export_path = os.path.join(image_dir, f"calib_{camera_model}_{camera_serial}.json")
+                calib_data = {
+                    "camera_model": camera_model,
+                    "camera_serial": camera_serial,
+                    "lens_model": lens_model,
+                    "image_size": imsize,
+                    "camera_matrix": camera_matrix.tolist(),
+                    "dist_coeffs": dist_coeffs.tolist(),
+                    "distortion_model": distortion_model,
+                    "aruco_dict": dict_option,
+                }
+                with open(export_path, "w") as f:
+                    json.dump(calib_data, f, indent=4)
+                st.success(f"Calibration exported to: {export_path}")
+
